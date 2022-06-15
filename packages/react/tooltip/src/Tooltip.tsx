@@ -35,18 +35,20 @@ type TooltipProviderContextValue = {
   delayDuration: number;
   onOpen(): void;
   onClose(): void;
+  isPointerInTransitRef: React.MutableRefObject<boolean>;
+  closeOnLeave: boolean;
 };
 
 const [TooltipProviderContextProvider, useTooltipProviderContext] =
-  createTooltipContext<TooltipProviderContextValue>(PROVIDER_NAME, {
-    isOpenDelayed: true,
-    delayDuration: DEFAULT_DELAY_DURATION,
-    onOpen: () => {},
-    onClose: () => {},
-  });
+  createTooltipContext<TooltipProviderContextValue>(PROVIDER_NAME);
 
 interface TooltipProviderProps {
   children: React.ReactNode;
+  /**
+   * Whether to close the tooltip immediately when the pointer leaves the trigger.
+   * @defaultValue false
+   */
+  closeOnLeave?: boolean;
   /**
    * The duration from when the pointer enters the trigger until the tooltip gets opened.
    * @defaultValue 700
@@ -66,9 +68,11 @@ const TooltipProvider: React.FC<TooltipProviderProps> = (
     __scopeTooltip,
     delayDuration = DEFAULT_DELAY_DURATION,
     skipDelayDuration = 300,
+    closeOnLeave = false,
     children,
   } = props;
   const [isOpenDelayed, setIsOpenDelayed] = React.useState(true);
+  const isPointerInTransitRef = React.useRef(false);
   const skipDelayTimerRef = React.useRef(0);
 
   React.useEffect(() => {
@@ -92,6 +96,8 @@ const TooltipProvider: React.FC<TooltipProviderProps> = (
           skipDelayDuration
         );
       }, [skipDelayDuration])}
+      isPointerInTransitRef={isPointerInTransitRef}
+      closeOnLeave={closeOnLeave}
     >
       {children}
     </TooltipProviderContextProvider>
@@ -108,11 +114,13 @@ const TOOLTIP_NAME = 'Tooltip';
 
 type TooltipContextValue = {
   contentId: string;
+  closeOnLeave: boolean;
   open: boolean;
   stateAttribute: 'closed' | 'delayed-open' | 'instant-open';
   trigger: TooltipTriggerElement | null;
   onTriggerChange(trigger: TooltipTriggerElement | null): void;
   onTriggerEnter(): void;
+  onTriggerLeave(): void;
   onOpen(): void;
   onClose(): void;
 };
@@ -125,7 +133,11 @@ interface TooltipProps {
   open?: boolean;
   defaultOpen?: boolean;
   onOpenChange?: (open: boolean) => void;
-
+  /**
+   * Whether to close the tooltip immediately when the pointer leaves the trigger.
+   * @defaultValue false
+   */
+  closeOnLeave?: boolean;
   /**
    * The duration from when the pointer enters the trigger until the tooltip gets opened. This will
    * override the prop with the same name passed to Provider.
@@ -135,34 +147,35 @@ interface TooltipProps {
 }
 
 const Tooltip: React.FC<TooltipProps> = (props: ScopedProps<TooltipProps>) => {
+  const providerContext = useTooltipProviderContext(TOOLTIP_NAME, props.__scopeTooltip);
   const {
     __scopeTooltip,
     children,
     open: openProp,
     defaultOpen = false,
     onOpenChange,
+    closeOnLeave: closeOnLeaveProp,
     delayDuration: delayDurationProp,
   } = props;
-  const context = useTooltipProviderContext(TOOLTIP_NAME, __scopeTooltip);
   const popperScope = usePopperScope(__scopeTooltip);
   const [trigger, setTrigger] = React.useState<HTMLButtonElement | null>(null);
   const contentId = useId();
   const openTimerRef = React.useRef(0);
-  const delayDuration = delayDurationProp ?? context.delayDuration;
+  const closeOnLeave = closeOnLeaveProp ?? providerContext.closeOnLeave;
+  const delayDuration = delayDurationProp ?? providerContext.delayDuration;
   const wasOpenDelayedRef = React.useRef(false);
-  const { onOpen, onClose } = context;
   const [open = false, setOpen] = useControllableState({
     prop: openProp,
     defaultProp: defaultOpen,
     onChange: (open) => {
       if (open) {
-        // we dispatch here so `TooltipProvider` isn't required to
-        // ensure other tooltips are aware of this one opening.
-        //
+        providerContext.onOpen();
+
         // as `onChange` is called within a lifecycle method we
         // avoid dispatching via `dispatchDiscreteCustomEvent`.
         document.dispatchEvent(new CustomEvent(TOOLTIP_OPEN));
-        onOpen();
+      } else {
+        providerContext.onClose();
       }
       onOpenChange?.(open);
     },
@@ -175,6 +188,11 @@ const Tooltip: React.FC<TooltipProps> = (props: ScopedProps<TooltipProps>) => {
     window.clearTimeout(openTimerRef.current);
     wasOpenDelayedRef.current = false;
     setOpen(true);
+  }, [setOpen]);
+
+  const handleClose = React.useCallback(() => {
+    window.clearTimeout(openTimerRef.current);
+    setOpen(false);
   }, [setOpen]);
 
   const handleDelayedOpen = React.useCallback(() => {
@@ -194,20 +212,30 @@ const Tooltip: React.FC<TooltipProps> = (props: ScopedProps<TooltipProps>) => {
       <TooltipContextProvider
         scope={__scopeTooltip}
         contentId={contentId}
+        closeOnLeave={closeOnLeave}
         open={open}
         stateAttribute={stateAttribute}
         trigger={trigger}
         onTriggerChange={setTrigger}
         onTriggerEnter={React.useCallback(() => {
-          if (context.isOpenDelayed) handleDelayedOpen();
+          if (providerContext.isPointerInTransitRef.current) return;
+          if (providerContext.isOpenDelayed) handleDelayedOpen();
           else handleOpen();
-        }, [context.isOpenDelayed, handleDelayedOpen, handleOpen])}
-        onOpen={React.useCallback(handleOpen, [handleOpen])}
-        onClose={React.useCallback(() => {
-          window.clearTimeout(openTimerRef.current);
-          setOpen(false);
-          onClose();
-        }, [setOpen, onClose])}
+        }, [
+          providerContext.isOpenDelayed,
+          providerContext.isPointerInTransitRef,
+          handleDelayedOpen,
+          handleOpen,
+        ])}
+        onTriggerLeave={React.useCallback(() => {
+          if (closeOnLeave) {
+            handleClose();
+          } else {
+            window.clearTimeout(openTimerRef.current);
+          }
+        }, [handleClose, closeOnLeave])}
+        onOpen={handleOpen}
+        onClose={handleClose}
       >
         {children}
       </TooltipContextProvider>
@@ -232,8 +260,10 @@ const TooltipTrigger = React.forwardRef<TooltipTriggerElement, TooltipTriggerPro
     const { __scopeTooltip, ...triggerProps } = props;
     const context = useTooltipContext(TRIGGER_NAME, __scopeTooltip);
     const popperScope = usePopperScope(__scopeTooltip);
-    const composedTriggerRef = useComposedRefs(forwardedRef, context.onTriggerChange);
+    const ref = React.useRef<TooltipTriggerElement>(null);
+    const composedRefs = useComposedRefs(forwardedRef, ref, context.onTriggerChange);
     const isPointerDownRef = React.useRef(false);
+    const wasPointerDown = React.useRef(false);
     const handlePointerUp = React.useCallback(() => (isPointerDownRef.current = false), []);
 
     React.useEffect(() => {
@@ -248,13 +278,18 @@ const TooltipTrigger = React.forwardRef<TooltipTriggerElement, TooltipTriggerPro
           aria-describedby={context.open ? context.contentId : undefined}
           data-state={context.stateAttribute}
           {...triggerProps}
-          ref={composedTriggerRef}
-          onPointerEnter={composeEventHandlers(props.onPointerEnter, (event) => {
+          ref={composedRefs}
+          onPointerMove={composeEventHandlers(props.onPointerMove, (event) => {
+            if (wasPointerDown.current) return;
             if (event.pointerType !== 'touch') context.onTriggerEnter();
           })}
-          onPointerLeave={composeEventHandlers(props.onPointerLeave, context.onClose)}
+          onPointerLeave={composeEventHandlers(props.onPointerLeave, () => {
+            wasPointerDown.current = false;
+            context.onTriggerLeave();
+          })}
           onPointerDown={composeEventHandlers(props.onPointerDown, () => {
             isPointerDownRef.current = true;
+            wasPointerDown.current = true;
             document.addEventListener('pointerup', handlePointerUp, { once: true });
           })}
           onFocus={composeEventHandlers(props.onFocus, () => {
@@ -330,15 +365,131 @@ interface TooltipContentProps extends TooltipContentImplProps {
 const TooltipContent = React.forwardRef<TooltipContentElement, TooltipContentProps>(
   (props: ScopedProps<TooltipContentProps>, forwardedRef) => {
     const portalContext = usePortalContext(CONTENT_NAME, props.__scopeTooltip);
-    const { forceMount = portalContext.forceMount, ...contentProps } = props;
+    const { forceMount = portalContext.forceMount, side = 'top', ...contentProps } = props;
     const context = useTooltipContext(CONTENT_NAME, props.__scopeTooltip);
+
     return (
       <Presence present={forceMount || context.open}>
-        <TooltipContentImpl ref={forwardedRef} {...contentProps} />
+        {context.closeOnLeave ? (
+          <TooltipContentImpl side={side} {...contentProps} ref={forwardedRef} />
+        ) : (
+          <TooltipContentPointerAccessible side={side} {...contentProps} ref={forwardedRef} />
+        )}
       </Presence>
     );
   }
 );
+
+type Point = { x: number; y: number };
+type Polygon = Point[];
+type Side = TooltipContentImplProps['side'];
+
+type TooltipContentPointerAccessibleElement = TooltipContentImplElement;
+interface TooltipContentPointerAccessibleProps extends TooltipContentImplProps {}
+
+const TooltipContentPointerAccessible = React.forwardRef<
+  TooltipContentPointerAccessibleElement,
+  TooltipContentPointerAccessibleProps
+>((props: ScopedProps<TooltipContentPointerAccessibleProps>, forwardedRef) => {
+  const context = useTooltipContext(TRIGGER_NAME, props.__scopeTooltip);
+  const providerContext = useTooltipProviderContext(TOOLTIP_NAME, props.__scopeTooltip);
+  const ref = React.useRef<TooltipContentPointerAccessibleElement>(null);
+  const composedRefs = useComposedRefs(forwardedRef, ref);
+  const [pointerGraceArea, setPointerGraceArea] = React.useState<Polygon | null>(null);
+  const pointerGraceTimerRef = React.useRef(0);
+
+  const { onClose } = context;
+
+  const handleRemoveGraceArea = React.useCallback(() => {
+    setPointerGraceArea(null);
+    removeDebugArea();
+    window.clearTimeout(pointerGraceTimerRef.current);
+    providerContext.isPointerInTransitRef.current = false;
+  }, [providerContext.isPointerInTransitRef]);
+
+  const handleCreateGraceArea = React.useCallback(() => {
+    const content = ref.current;
+    const trigger = context.trigger;
+
+    if (content && trigger) {
+      const side = content.dataset.side as Side;
+      if (side) {
+        const triggerRect = trigger.getBoundingClientRect();
+        const contentRect = content.getBoundingClientRect();
+        const triggerEdges = getEdgesFromRect(triggerRect);
+        const contentEdges = getEdgesFromRect(contentRect);
+        const isXAxis = side === 'left' || side === 'right';
+        const [contentFarEdge, contentNearEdge] = contentEdges[side];
+        const [triggerFarEdge] = triggerEdges[side];
+
+        const shouldTrimNearEdge = isXAxis
+          ? contentRect.height < triggerRect.height
+          : contentRect.width < triggerRect.width;
+
+        const [startPoint, ...lastPoints] = shouldTrimNearEdge
+          ? contentFarEdge
+          : contentNearEdge.concat(contentFarEdge.reverse());
+
+        const graceArea = [startPoint, ...triggerFarEdge, ...lastPoints];
+        setPointerGraceArea(graceArea);
+        createDebugArea(graceArea);
+      }
+
+      pointerGraceTimerRef.current = window.setTimeout(() => {
+        onClose();
+        handleRemoveGraceArea();
+      }, 500);
+
+      providerContext.isPointerInTransitRef.current = true;
+    }
+  }, [context.trigger, onClose, handleRemoveGraceArea, providerContext.isPointerInTransitRef]);
+
+  React.useEffect(() => {
+    return () => handleRemoveGraceArea();
+  }, [handleRemoveGraceArea]);
+
+  React.useEffect(() => {
+    const trigger = context.trigger;
+    const content = ref.current;
+
+    if (trigger && content) {
+      trigger.addEventListener('pointermove', handleRemoveGraceArea);
+      content.addEventListener('pointermove', handleRemoveGraceArea);
+      trigger.addEventListener('pointerleave', handleCreateGraceArea);
+      content.addEventListener('pointerleave', handleCreateGraceArea);
+
+      return () => {
+        trigger.removeEventListener('pointermove', handleRemoveGraceArea);
+        content.removeEventListener('pointermove', handleRemoveGraceArea);
+        trigger.removeEventListener('pointerleave', handleCreateGraceArea);
+        content.removeEventListener('pointerleave', handleCreateGraceArea);
+      };
+    }
+  }, [context.trigger, handleCreateGraceArea, handleRemoveGraceArea]);
+
+  React.useEffect(() => {
+    if (pointerGraceArea) {
+      const handleTrackPointerGrace = (event: PointerEvent) => {
+        if (!isPointerInGraceArea(event, pointerGraceArea)) {
+          handleRemoveGraceArea();
+          // The trigger area is not mapped by the grace area so when we transition
+          // to it we want to prevent closing the content.
+          if (event.target !== context.trigger) onClose();
+        }
+      };
+      document.addEventListener('pointermove', handleTrackPointerGrace);
+      return () => document.removeEventListener('pointermove', handleTrackPointerGrace);
+    }
+  }, [
+    providerContext.isPointerInTransitRef,
+    context.trigger,
+    pointerGraceArea,
+    onClose,
+    handleRemoveGraceArea,
+  ]);
+
+  return <TooltipContentImpl {...props} ref={composedRefs} />;
+});
 
 type TooltipContentImplElement = React.ElementRef<typeof PopperPrimitive.Content>;
 type DismissableLayerProps = Radix.ComponentPropsWithoutRef<typeof DismissableLayer>;
@@ -447,6 +598,85 @@ const TooltipArrow = React.forwardRef<TooltipArrowElement, TooltipArrowProps>(
 TooltipArrow.displayName = ARROW_NAME;
 
 /* -----------------------------------------------------------------------------------------------*/
+
+// Determine if a point is inside of a polygon.
+// Based on https://github.com/substack/point-in-polygon
+function isPointInPolygon(point: Point, polygon: Polygon) {
+  const { x, y } = point;
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i].x;
+    const yi = polygon[i].y;
+    const xj = polygon[j].x;
+    const yj = polygon[j].y;
+
+    // prettier-ignore
+    const intersect = ((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+    if (intersect) inside = !inside;
+  }
+
+  return inside;
+}
+
+function getEdgesFromRect(rect: DOMRect) {
+  const { top, right, bottom, left } = rect;
+
+  const edges = {
+    top: [
+      { x: left, y: top },
+      { x: right, y: top },
+    ],
+    bottom: [
+      { x: left, y: bottom },
+      { x: right, y: bottom },
+    ],
+    left: [
+      { x: left, y: top },
+      { x: left, y: bottom },
+    ],
+    right: [
+      { x: right, y: top },
+      { x: right, y: bottom },
+    ],
+  };
+
+  return {
+    bottom: [edges.bottom, edges.top],
+    top: [edges.top, edges.bottom],
+    left: [edges.left, edges.right],
+    right: [edges.right, edges.left],
+  };
+}
+
+function isPointerInGraceArea(event: PointerEvent, area: Polygon | null) {
+  if (!area) return false;
+  const cursorPos = { x: event.clientX, y: event.clientY };
+  return isPointInPolygon(cursorPos, area);
+}
+
+function createDebugArea(area: Polygon) {
+  const graceArea = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  graceArea.id = 'graceArea';
+  graceArea.setAttribute('viewBox', '0 0 1000 1000');
+  graceArea.setAttribute('width', '1000');
+  graceArea.setAttribute('height', '1000');
+  graceArea.style.position = 'fixed';
+  graceArea.style.top = '0px';
+  graceArea.style.left = '0px';
+  graceArea.style.zIndex = '2147483647';
+  graceArea.style.pointerEvents = 'none';
+  const polygon = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
+  polygon.id = 'polygon';
+  polygon.setAttribute('points', area.map((point) => `${point.x},${point.y}`).join(' '));
+  polygon.setAttribute('fill', 'rgba(0, 255, 0, 0.2)');
+  polygon.setAttribute('stroke', 'green');
+  graceArea.appendChild(polygon);
+  document.body.appendChild(graceArea);
+}
+
+function removeDebugArea() {
+  document.getElementById('graceArea')?.remove();
+}
 
 const Provider = TooltipProvider;
 const Root = Tooltip;
